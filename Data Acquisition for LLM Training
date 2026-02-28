@@ -1,0 +1,619 @@
+"""
+Common Crawl CDX -> WARC (range fetch) -> HTML -> Trafilatura -> Clean dataset
+Two-phase, professional workflow:
+
+PHASE 1 (Index):  Query CDX once and cache to disk as JSONL:
+    <out_dir>/cdx_pool.jsonl
+
+PHASE 2 (Extract): Load cached pool and build:
+    <out_dir>/dataset.txt   (one paragraph per line)
+    <out_dir>/sources.csv   (domain,url samples for report)
+
+PLUS: Metadata/Tag cleanup
+- Drops lines that start with "Tags:"
+- Removes trailing "Tags: ...." segments if appended at end of a line
+- Drops metadata-heavy lines (many pipes) to avoid training noise
+
+Colab install:
+  !pip -q install aiohttp warcio trafilatura tldextract langdetect transformers
+"""
+
+from __future__ import annotations
+
+import asyncio
+import collections
+import csv
+import gzip
+import hashlib
+import io
+import json
+import os
+import random
+import re
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
+
+import aiohttp
+import tldextract
+import trafilatura
+from langdetect import detect
+from transformers import GPT2TokenizerFast
+from warcio.archiveiterator import ArchiveIterator
+
+
+# -----------------------------
+# Configuration
+# -----------------------------
+
+@dataclass(frozen=True)
+class Config:
+    # Common Crawl
+    crawl: str = "CC-MAIN-2026-08"
+    domains: Tuple[str, ...] = (
+        "canada.ca",
+        "gc.ca",
+        "ontario.ca",
+        "alberta.ca",
+        "uottawa.ca",
+        "sfu.ca",
+        "mcgill.ca",
+        # Optional edu domains:
+        # "utoronto.ca", "ubc.ca", "uwaterloo.ca"
+    )
+
+    # Outputs
+    out_dir: str = "cdx_out"
+    cdx_pool_file: str = "cdx_pool.jsonl"
+    dataset_file: str = "dataset.txt"
+    sources_file: str = "sources.csv"
+
+    # Targets
+    token_target: int = 6_000_000
+
+    # CDX collection
+    cdx_per_domain: int = 50_000
+    cdx_page_size: int = 5_000
+
+    # Extraction performance
+    concurrency: int = 12
+    task_batch_size: int = 500
+
+    # Record size controls
+    max_bytes_per_page: int = 2_000_000
+    max_tokens_per_paragraph: int = 1200
+    max_par_chars: int = 5000
+
+    # Text quality controls
+    min_par_chars: int = 90
+    require_sentences: int = 2
+    langdetect_prefix_chars: int = 1500
+
+    # Tag/metadata cleanup controls
+    drop_tag_lines: bool = True
+    strip_tags_tail: bool = True
+    drop_pipe_heavy_lines: bool = True
+    pipe_heavy_threshold: int = 8  # drop if line has >= this many '|'
+
+    # Robustness
+    cdx_retries: int = 6
+    cdx_page_attempts: int = 4
+    warc_retries: int = 5
+
+    # Reproducibility
+    seed: int = 7
+
+    # Logging
+    warn_on_stall: bool = True
+
+
+BAD_URL_PATTERNS: Tuple[str, ...] = (
+    "sitemap", "search", "calendar", "login", "signin", "signup",
+    "tag/", "category/", "/tags", "/categories", "archive", "monthly",
+    "rss", "atom", "wp-json", "api/", "download",
+    ".pdf", ".zip", ".csv", ".json", ".xml", ".mp4", ".mp3", ".jpg", ".png"
+)
+
+SPACE = re.compile(r"\s+")
+TAG_LINE_RE = re.compile(r"^\s*tags\s*:\s*", re.IGNORECASE)     # startswith Tags:
+TAGS_TAIL_RE = re.compile(r"\bTags\s*:\s*.*$", re.IGNORECASE)   # remove Tags: ... to end
+
+
+# -----------------------------
+# Utilities
+# -----------------------------
+
+def normalize_domain(host: str) -> str:
+    """Convert a host to its registered domain (e.g., www.statcan.gc.ca -> gc.ca)."""
+    host = host.lower()
+    ext = tldextract.extract(host)
+    reg = ".".join([x for x in [ext.domain, ext.suffix] if x])
+    return reg if reg else host
+
+def host_allowed(url: str, allowed_domains: Set[str]) -> bool:
+    """True if the URL's registered domain is in allowed_domains or a subdomain of it."""
+    try:
+        host = urlparse(url).netloc.lower()
+        if not host:
+            return False
+        reg = normalize_domain(host)
+        return any(reg == d or reg.endswith("." + d) for d in allowed_domains)
+    except Exception:
+        return False
+
+def url_looks_useful(url: str) -> bool:
+    u = url.lower()
+    return not any(p in u for p in BAD_URL_PATTERNS)
+
+def is_english(text: str) -> bool:
+    """Lightweight language check (best-effort)."""
+    try:
+        return detect(text) == "en"
+    except Exception:
+        return False
+
+def clean_paragraphs(text: str, *, min_chars: int, require_sentences: int) -> List[str]:
+    """Split extracted main text into paragraph-like lines and keep prose-like ones."""
+    text = text.replace("\u00a0", " ").strip()
+    paras = [p.strip() for p in re.split(r"\n{1,}", text) if p.strip()]
+
+    good: List[str] = []
+    for p in paras:
+        p = SPACE.sub(" ", p).strip()
+        if len(p) < min_chars:
+            continue
+        if (p.count(".") + p.count("?") + p.count("!")) < require_sentences:
+            continue
+        if p.count("•") > 3 or p.count("»") > 1:
+            continue
+        good.append(p)
+    return good
+
+def sanitize_line(line: str, cfg: Config) -> Optional[str]:
+    """
+    Remove metadata/tag noise.
+    Returns cleaned line or None if line should be dropped.
+    """
+    s = SPACE.sub(" ", line.strip())
+    if not s:
+        return None
+
+    # Drop lines that are explicitly tags
+    if cfg.drop_tag_lines and TAG_LINE_RE.match(s):
+        return None
+
+    # Remove trailing Tags: ... if appended after content
+    if cfg.strip_tags_tail:
+        s = TAGS_TAIL_RE.sub("", s).strip()
+        if not s:
+            return None
+
+    # Drop metadata-heavy lines full of pipes
+    if cfg.drop_pipe_heavy_lines and s.count("|") >= cfg.pipe_heavy_threshold:
+        return None
+
+    return s
+
+
+# -----------------------------
+# CDX Fetching (paged + robust)
+# -----------------------------
+
+async def fetch_text_with_retries(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: int = 180,
+    retries: int = 6,
+) -> str:
+    backoff = 1.0
+    for i in range(retries):
+        try:
+            async with session.get(url, params=params, timeout=timeout) as resp:
+                if resp.status in (429, 500, 502, 503, 504):
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info, resp.history, status=resp.status,
+                        message="transient", headers=resp.headers
+                    )
+                resp.raise_for_status()
+                return await resp.text()
+        except (aiohttp.ClientPayloadError, aiohttp.ClientConnectionError,
+                aiohttp.ClientResponseError, asyncio.TimeoutError):
+            if i == retries - 1:
+                raise
+            await asyncio.sleep(backoff + random.random())
+            backoff = min(30.0, backoff * 2)
+    raise RuntimeError("fetch_text_with_retries exhausted unexpectedly")
+
+def parse_cdx_json_lines(txt: str) -> List[Dict[str, Any]]:
+    """Parse JSON-lines; skip malformed lines to survive truncation."""
+    rows: List[Dict[str, Any]] = []
+    for line in txt.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line[0] not in "{[":
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+async def cdx_query_domain_paged(
+    session: aiohttp.ClientSession,
+    *,
+    crawl: str,
+    domain: str,
+    total_limit: int,
+    page_size: int,
+    retries: int,
+    page_attempts: int,
+) -> List[Dict[str, Any]]:
+    """
+    Query Common Crawl CDX index for a domain in pages.
+    Paging avoids TransferEncoding errors on huge responses.
+    """
+    base = f"https://index.commoncrawl.org/{crawl}-index"
+    collected: List[Dict[str, Any]] = []
+    page = 0
+
+    while len(collected) < total_limit:
+        this_limit = min(page_size, total_limit - len(collected))
+        params = {
+            "url": domain,
+            "matchType": "domain",
+            "output": "json",
+            "filter": ["status:200", "mime:text/html"],
+            "collapse": "urlkey",
+            "limit": str(this_limit),
+            "page": str(page),
+        }
+
+        rows: List[Dict[str, Any]] = []
+        for attempt in range(page_attempts):
+            txt = await fetch_text_with_retries(session, base, params=params, timeout=180, retries=retries)
+            rows = parse_cdx_json_lines(txt)
+            if rows:
+                break
+            await asyncio.sleep(1.5 * (attempt + 1) + random.random())
+
+        if not rows:
+            break
+
+        rows = [r for r in rows if url_looks_useful(r.get("url", ""))]
+        collected.extend(rows)
+        page += 1
+
+        if len(rows) < this_limit:
+            break
+
+    return collected
+
+
+# -----------------------------
+# Caching: CDX pool JSONL
+# -----------------------------
+
+def pool_path(cfg: Config) -> str:
+    return os.path.join(cfg.out_dir, cfg.cdx_pool_file)
+
+def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+def read_jsonl(path: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+# -----------------------------
+# WARC Range Fetch + HTML Extraction
+# -----------------------------
+
+async def fetch_warc_record_bytes(
+    session: aiohttp.ClientSession,
+    *,
+    filename: str,
+    offset: int,
+    length: int,
+    retries: int,
+) -> Optional[bytes]:
+    """Download one WARC record via HTTP Range request."""
+    url = "https://data.commoncrawl.org/" + filename
+    headers = {"Range": f"bytes={offset}-{offset+length-1}"}
+
+    backoff = 1.0
+    for i in range(retries):
+        try:
+            async with session.get(url, headers=headers, timeout=180) as resp:
+                if resp.status in (429, 500, 502, 503, 504):
+                    raise RuntimeError(f"transient {resp.status}")
+                resp.raise_for_status()
+                return await resp.read()
+        except Exception:
+            if i == retries - 1:
+                return None
+            await asyncio.sleep(backoff + random.random())
+            backoff = min(20.0, backoff * 2)
+    return None
+
+def extract_html_from_warc_bytes(warc_bytes: bytes) -> Optional[str]:
+    """
+    Robust extraction:
+      - CDX offsets typically point to a gz member containing a WARC record.
+      - Try gzip decompress first; if it fails, try raw bytes.
+      - Parse with warcio ArchiveIterator.
+    """
+    if not warc_bytes:
+        return None
+
+    candidates: List[bytes] = []
+    try:
+        candidates.append(gzip.decompress(warc_bytes))
+    except Exception:
+        pass
+    candidates.append(warc_bytes)
+
+    for raw in candidates:
+        try:
+            stream = io.BytesIO(raw)
+            for record in ArchiveIterator(stream):
+                if record.rec_type != "response":
+                    continue
+                body = record.content_stream().read()
+                if not body:
+                    continue
+                html = body.decode("utf-8", errors="ignore")
+                if len(html) > 500:
+                    return html
+        except Exception:
+            continue
+
+    return None
+
+def extract_main_text(html: str, url: str) -> Optional[str]:
+    """Boilerplate removal via Trafilatura."""
+    try:
+        return trafilatura.extract(
+            html,
+            url=url,
+            include_comments=False,
+            include_tables=False,
+            favor_recall=False,
+        )
+    except Exception:
+        return None
+
+
+# -----------------------------
+# Phase 1: Build and cache CDX pool
+# -----------------------------
+
+async def build_cdx_pool(cfg: Config) -> str:
+    """
+    Query CDX for each domain and write a cached pool to disk.
+    Returns the path to cdx_pool.jsonl.
+    """
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    allowed_domains = {d.lower().strip() for d in cfg.domains}
+
+    connector = aiohttp.TCPConnector(limit=cfg.concurrency, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        all_rows: List[Dict[str, Any]] = []
+
+        for d in cfg.domains:
+            print(f"CDX query: {d}")
+            rows = await cdx_query_domain_paged(
+                session,
+                crawl=cfg.crawl,
+                domain=d,
+                total_limit=cfg.cdx_per_domain,
+                page_size=cfg.cdx_page_size,
+                retries=cfg.cdx_retries,
+                page_attempts=cfg.cdx_page_attempts,
+            )
+            rows = [r for r in rows if host_allowed(r.get("url", ""), allowed_domains)]
+            print(f"  got {len(rows)} candidates")
+            all_rows.extend(rows)
+
+    # Deduplicate CDX pool by urlkey if present; else by url
+    seen_key: Set[str] = set()
+    deduped: List[Dict[str, Any]] = []
+    for r in all_rows:
+        key = r.get("urlkey") or r.get("url") or ""
+        if not key or key in seen_key:
+            continue
+        seen_key.add(key)
+        deduped.append(r)
+
+    # Deterministic shuffle
+    rnd = random.Random(cfg.seed)
+    rnd.shuffle(deduped)
+
+    path = pool_path(cfg)
+    write_jsonl(path, deduped)
+    print(f"\nCDX pool saved: {path} (records: {len(deduped):,})")
+    return path
+
+
+# -----------------------------
+# Phase 2: Extract dataset from cached pool
+# -----------------------------
+
+async def build_dataset_from_pool(cfg: Config, pool_file: str) -> None:
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    out_txt = os.path.join(cfg.out_dir, cfg.dataset_file)
+    out_csv = os.path.join(cfg.out_dir, cfg.sources_file)
+
+    # Fresh run (overwrite)
+    open(out_txt, "w", encoding="utf-8").close()
+
+    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+
+    token_count = 0
+    seen_para: Set[str] = set()
+    kept_urls: List[str] = []
+    kept_url_set: Set[str] = set()
+    skip = collections.Counter()
+    cleaned = collections.Counter()
+
+    pool = read_jsonl(pool_file)
+    print(f"\nLoaded CDX pool: {pool_file} (records: {len(pool):,})")
+    print("\nProcessing pages...")
+
+    connector = aiohttp.TCPConnector(limit=cfg.concurrency, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        sem = asyncio.Semaphore(cfg.concurrency)
+
+        async def process_one(r: Dict[str, Any]) -> None:
+            nonlocal token_count
+
+            url = r.get("url", "")
+            filename = r.get("filename")
+            offset = int(r.get("offset", "0"))
+            length = int(r.get("length", "0"))
+
+            if not url or not filename or length <= 0:
+                skip["bad_meta"] += 1
+                return
+
+            if length > cfg.max_bytes_per_page:
+                skip["too_big"] += 1
+                return
+
+            async with sem:
+                warc_bytes = await fetch_warc_record_bytes(
+                    session,
+                    filename=filename,
+                    offset=offset,
+                    length=length,
+                    retries=cfg.warc_retries,
+                )
+                if not warc_bytes:
+                    skip["fetch_fail"] += 1
+                    return
+
+                html = extract_html_from_warc_bytes(warc_bytes)
+                if not html:
+                    skip["html_none"] += 1
+                    return
+
+                text = extract_main_text(html, url)
+                if not text or len(text) < 250:
+                    skip["text_none"] += 1
+                    return
+
+                if not is_english(text[: cfg.langdetect_prefix_chars]):
+                    skip["non_en"] += 1
+                    return
+
+                paras = clean_paragraphs(text, min_chars=cfg.min_par_chars, require_sentences=cfg.require_sentences)
+                if not paras:
+                    skip["no_paras"] += 1
+                    return
+
+                wrote_any = False
+                with open(out_txt, "a", encoding="utf-8") as f:
+                    for p in paras:
+                        if len(p) > cfg.max_par_chars:
+                            skip["par_too_long"] += 1
+                            continue
+
+                        # ----- NEW: tag/metadata cleanup -----
+                        cleaned_line = sanitize_line(p, cfg)
+                        if cleaned_line is None:
+                            cleaned["dropped_by_sanitize"] += 1
+                            continue
+
+                        h = hashlib.sha1(cleaned_line.encode("utf-8")).hexdigest()
+                        if h in seen_para:
+                            skip["dedup_para"] += 1
+                            continue
+                        seen_para.add(h)
+
+                        toks = tokenizer.encode(cleaned_line)
+                        if len(toks) > cfg.max_tokens_per_paragraph:
+                            skip["tok_too_long"] += 1
+                            continue
+
+                        token_count += len(toks)
+                        f.write(cleaned_line + "\n")
+                        wrote_any = True
+
+                        if token_count >= cfg.token_target:
+                            break
+
+                if wrote_any and url not in kept_url_set:
+                    kept_url_set.add(url)
+                    kept_urls.append(url)
+
+        # Batch execution for stable memory
+        t0 = time.time()
+        last_tokens = 0
+        tasks: List[asyncio.Task[None]] = []
+        processed = 0
+
+        for r in pool:
+            if token_count >= cfg.token_target:
+                break
+            tasks.append(asyncio.create_task(process_one(r)))
+            processed += 1
+
+            if len(tasks) >= cfg.task_batch_size:
+                await asyncio.gather(*tasks)
+                tasks = []
+
+                delta = token_count - last_tokens
+                last_tokens = token_count
+                elapsed = time.time() - t0
+                print(f"  processed ~{processed:,} pages | tokens: {token_count:,} (+{delta:,}) | {elapsed:.1f}s")
+
+                if cfg.warn_on_stall and delta == 0:
+                    print("  ⚠️  No tokens added in last batch. Top skip reasons:", skip.most_common(6))
+
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    # Write sources CSV
+    with open(out_csv, "w", newline="", encoding="utf-8") as fcsv:
+        w = csv.writer(fcsv)
+        w.writerow(["domain", "url"])
+        for u in kept_urls[:5000]:
+            w.writerow([normalize_domain(urlparse(u).netloc), u])
+
+    print("\nDONE ✅")
+    print(f"Tokens: {token_count:,}")
+    print(f"Dataset: {out_txt}")
+    print(f"Sources: {out_csv}")
+    print("\nSkip summary:", skip.most_common(12))
+    print("\nCleanup summary:", cleaned.most_common(8))
+
+
+# -----------------------------
+# Entry point (Colab)
+# -----------------------------
+
+cfg = Config()
+
+# Phase 1: build pool once (cached). If it exists, reuse it.
+pool_file = pool_path(cfg)
+if not os.path.exists(pool_file):
+    pool_file = await build_cdx_pool(cfg)
+else:
+    print(f"Using cached CDX pool: {pool_file}")
+
+# Phase 2: build dataset from cached pool (with tag/metadata cleanup)
+await build_dataset_from_pool(cfg, pool_file)
