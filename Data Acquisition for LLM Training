@@ -603,17 +603,28 @@ async def build_dataset_from_pool(cfg: Config, pool_file: str) -> None:
 
 
 # -----------------------------
-# Entry point (Colab)
+# -----------------------------
+# Entry point (Colab-safe)
 # -----------------------------
 
 cfg = Config()
 
-# Phase 1: build pool once (cached). If it exists, reuse it.
-pool_file = pool_path(cfg)
-if not os.path.exists(pool_file):
-    pool_file = await build_cdx_pool(cfg)
-else:
-    print(f"Using cached CDX pool: {pool_file}")
+async def main():
+    # Phase 1: build pool once (cached). If it exists, reuse it.
+    pool_file = pool_path(cfg)
+    if not os.path.exists(pool_file):
+        pool_file = await build_cdx_pool(cfg)
+    else:
+        print(f"Using cached CDX pool: {pool_file}")
 
-# Phase 2: build dataset from cached pool (with tag/metadata cleanup)
-await build_dataset_from_pool(cfg, pool_file)
+    # Phase 2: build dataset from cached pool (with tag/metadata cleanup)
+    await build_dataset_from_pool(cfg, pool_file)
+
+# Colab: run main() even if a loop already exists
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except Exception:
+    pass
+
+await main()
